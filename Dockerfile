@@ -5,4 +5,9 @@
 FROM apache/airflow:2.9.3-python3.11
 
 COPY requirements.txt /requirements.txt
-RUN pip install --no-cache-dir -r /requirements.txt
+
+# Airflow 코어/provider와 얽힌 의존성 그래프를 pip 혼자 풀게 두면 버전
+# 조합 폭발(ResolutionTooDeep)이 난다. Airflow가 매 릴리스마다 검증해서
+# 공개하는 공식 constraints 파일을 같이 넘겨 호환 버전으로 강제한다.
+RUN pip install --no-cache-dir -r /requirements.txt \
+    --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.9.3/constraints-3.11.txt"
