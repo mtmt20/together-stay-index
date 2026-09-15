@@ -1,0 +1,129 @@
+# Together-Stay Index 전용 Airflow 스택 (LocalExecutor + Postgres 단일 스택)
+# =====================================================================
+# 격리 포인트 (기존 프로젝트와 절대 충돌하지 않기 위한 조치):
+#   - container_name / volume / network 전부 "tsi_" 접두어로 고유화
+#   - 호스트 포트: 웹서버 8090 (기존 위스키 Airflow는 8080 사용 중이라 회피),
+#     Postgres 55432 (기본 5432/기존 프로젝트와 겹치지 않도록 회피)
+#   - 이미지도 Dockerfile로 별도 빌드 (기존 커스텀 이미지 재사용 안 함)
+#   - .env 파일로 자격증명을 주입하며, 그 안의 S3 버킷/Snowflake DB명도
+#     이 프로젝트 전용 이름을 쓰도록 .env.example에 강제 명시
+#   - Streamlit 포트 8510 (기존 위스키 Streamlit들은 8501~8504 사용 중이라 회피)
+#   - dbt는 상시 구동 서비스가 아니라 `docker compose run --rm tsi-dbt ...`로만
+#     실행되는 "tools" 프로필로 분리 (docker compose up 시 자동 기동 안 됨 -
+#     dbt run이 곧 Snowflake 웨어하우스를 깨우는 행위이므로 의도치 않게
+#     계속 떠 있으면 안 된다)
+
+x-airflow-common: &airflow-common
+  build: .
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@tsi-postgres/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    # 크롤러/S3/Snowflake 관련 자격증명은 .env 파일에서 주입된다.
+    NAVER_CLIENT_ID: ${NAVER_CLIENT_ID}
+    NAVER_CLIENT_SECRET: ${NAVER_CLIENT_SECRET}
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+    AWS_S3_BUCKET: ${AWS_S3_BUCKET}
+    PYTHONPATH: /opt/airflow/dags
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+  depends_on:
+    tsi-postgres:
+      condition: service_healthy
+
+services:
+  tsi-postgres:
+    image: postgres:15
+    container_name: tsi_postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - tsi_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "55432:5432"  # 호스트에서 직접 조회하고 싶을 때만 사용, 기본 5432와 충돌 방지
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+    networks:
+      - tsi_network
+
+  tsi-airflow-init:
+    <<: *airflow-common
+    container_name: tsi_airflow_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - airflow db migrate && airflow users create --username admin --password admin --firstname Together --lastname Stay --role Admin --email admin@example.com || true
+    networks:
+      - tsi_network
+
+  tsi-airflow-webserver:
+    <<: *airflow-common
+    container_name: tsi_airflow_webserver
+    command: webserver
+    ports:
+      - "8090:8080"  # 기존 위스키 Airflow(8080)와 겹치지 않도록 호스트만 8090으로 회피
+    depends_on:
+      - tsi-airflow-init
+    networks:
+      - tsi_network
+
+  tsi-airflow-scheduler:
+    <<: *airflow-common
+    container_name: tsi_airflow_scheduler
+    command: scheduler
+    depends_on:
+      - tsi-airflow-init
+    networks:
+      - tsi_network
+
+  tsi-streamlit:
+    build: ./streamlit_app
+    container_name: tsi_streamlit
+    environment:
+      SNOWFLAKE_ACCOUNT: ${SNOWFLAKE_ACCOUNT}
+      SNOWFLAKE_USER: ${SNOWFLAKE_USER}
+      SNOWFLAKE_PASSWORD: ${SNOWFLAKE_PASSWORD}
+      SNOWFLAKE_ROLE: ${SNOWFLAKE_ROLE:-SYSADMIN}
+      SNOWFLAKE_WAREHOUSE: ${SNOWFLAKE_WAREHOUSE}
+    ports:
+      - "8510:8501"  # 기존 위스키 Streamlit(8501~8504)과 겹치지 않도록 회피
+    networks:
+      - tsi_network
+
+  tsi-dbt:
+    build:
+      context: ./dbt
+      dockerfile: Dockerfile
+    container_name: tsi_dbt
+    profiles: ["tools"]  # `docker compose up`에 포함되지 않음. 수동 실행 전용.
+    environment:
+      SNOWFLAKE_ACCOUNT: ${SNOWFLAKE_ACCOUNT}
+      SNOWFLAKE_USER: ${SNOWFLAKE_USER}
+      SNOWFLAKE_PASSWORD: ${SNOWFLAKE_PASSWORD}
+      SNOWFLAKE_ROLE: ${SNOWFLAKE_ROLE:-SYSADMIN}
+      SNOWFLAKE_WAREHOUSE: ${SNOWFLAKE_WAREHOUSE}
+      DBT_PROFILES_DIR: /dbt
+    volumes:
+      - ./dbt:/dbt
+    working_dir: /dbt
+    entrypoint: ["dbt"]
+    command: ["run"]
+    networks:
+      - tsi_network
+
+networks:
+  tsi_network:
+    name: tsi_network
+
+volumes:
+  tsi_postgres_data:
+    name: tsi_postgres_data

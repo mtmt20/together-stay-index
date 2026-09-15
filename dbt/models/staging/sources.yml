@@ -1,0 +1,9 @@
+version: 2
+
+sources:
+  - name: raw
+    database: TOGETHER_STAY_DB
+    schema: RAW
+    tables:
+      - name: naver_posts_raw
+        description: "Step2 Airflow DAG가 S3에서 COPY INTO로 적재한 네이버 크롤링 원본(VARIANT)"

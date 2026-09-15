@@ -1,0 +1,21 @@
+# ~/.dbt/profiles.yml 에 이 내용을 복사해 넣거나, DBT_PROFILES_DIR로 이 폴더를
+# 가리키게 설정한다. 비밀번호를 파일에 직접 쓰지 않고 환경변수로 주입한다.
+#
+# 기존 프로젝트(위스키 등)가 이미 dbt profiles.yml을 쓰고 있다면, 이 블록을
+# "추가"만 하고 기존 profile 이름/DB는 절대 건드리지 말 것. database는
+# 반드시 TOGETHER_STAY_DB로 새 값을 써서 기존 DB와 분리된 상태를 유지한다.
+
+together_stay_index:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE', 'SYSADMIN') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE') }}"
+      database: TOGETHER_STAY_DB
+      schema: SILVER
+      threads: 4
+      client_session_keep_alive: false

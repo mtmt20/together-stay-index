@@ -1,0 +1,21 @@
+# Together-Stay Index dbt 프로젝트
+# Bronze(S3) -> Raw(Snowflake, Step2 DAG가 적재) -> Silver(staging) -> Gold(marts)
+
+name: 'together_stay_index'
+version: '1.0.0'
+config-version: 2
+
+profile: 'together_stay_index'  # profiles.yml 의 target 이름과 일치해야 함
+
+model-paths: ["models"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  together_stay_index:
+    staging:
+      +schema: silver
+      +materialized: view
+    marts:
+      +schema: gold
+      +materialized: table
