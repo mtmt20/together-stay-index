@@ -8,10 +8,9 @@
 
 ## 현재 실행 중 (세션 시작 시 가장 먼저 확인 - `docker compose ps`로 실제 상태도 같이 확인할 것)
 
-**(2026-09-16 기준) 없음.** 아직 `docker compose up`을 한 번도 실행한 적 없음
-(이미지 빌드까지만 완료됨). 이 줄을 안 고치고 세션이 뭔가를 띄웠다면 여기 업데이트할 것 -
-예: "2026-09-16 밤, 데스크톱 세션이 `docker compose up -d` 실행 중, 끝내려면
-`docker compose down`".
+**(2026-09-17 기준) `docker compose up -d`로 5개 컨테이너 전부 떠 있음** (webserver
+헬스체크 통과 확인됨, http://localhost:8090). 안 쓸 때는 `docker compose stop`으로
+내려두는 걸 권장 (아래 자원 이슈 참고 - 위스키랑 같이 돌리는 거라 필요할 때만 켜기).
 
 ## 프로젝트 개요
 
@@ -26,6 +25,40 @@ Connection id를 전부 새로 만들어서 절대 안 겹치게 설계했다 (�
 "기존 프로젝트와의 충돌 방지 체크리스트" 표 참고).
 
 ## 최근 업데이트 (최신이 위로)
+
+### 2026-09-17 밤, 데스크톱 - Snowflake 초기 세팅 완료 + 스택 최초 기동 + 호스트 메모리 부족 발견/해결
+- 사용자가 준 Naver 없이 진행 가능한 것들부터: AWS 콘솔에서 `together-stay-index-bronze`
+  버킷 생성, 전용 IAM 사용자 `together-stay-index-uploader`(AmazonS3FullAccess) +
+  액세스 키 발급, `.env`에 기입. Snowflake는 `ALTER USER mtmt20 SET RSA_PUBLIC_KEY_2=...`
+  사용자가 직접 실행 완료 확인.
+- `dags/sql/snowflake_setup.sql`을 그대로 쓰지 않고, scratchpad에 임시 Python
+  스크립트(snowflake-connector-python + 키페어)를 짜서 **DB/스키마/스테이지/테이블을
+  Claude가 직접 실행해서 생성함** (STORAGE INTEGRATION 대신 스테이지에 AWS
+  액세스키를 직접 CREDENTIALS로 넣는 방식으로 단순화 - IAM Role 신뢰관계 설정 안
+  거쳐도 됨). 4개 문 전부 OK 확인.
+- `docker compose up -d`로 **이 프로젝트 최초 기동**. 처음엔 `tsi-airflow-webserver`/
+  `scheduler`가 `depends_on: tsi-airflow-init`이 "시작"만 기다리고 "완료"는 안
+  기다려서, `airflow db migrate`가 끝나기 전에 떠버려 "DB 초기화 안 됨" 에러로 죽는
+  경합조건 발견 → `condition: service_completed_successfully`로 수정.
+- **더 큰 문제**: 위스키 스택(6개 컨테이너)이랑 이 프로젝트 스택(5개)이 이 컴퓨터에서
+  동시에 도니, Docker(WSL2)에 할당된 메모리가 7.7GB뿐이라(실물 15.9GB인데
+  `.wslconfig`가 없어서 기본값인 절반만 씀) 부족해서 `tsi-airflow-webserver`의
+  gunicorn이 "No response from gunicorn master within 120 seconds"로 죽음
+  (위스키 HANDOFF에 있던 그 크래시 패턴과 동일 증상 - 원인은 pid 파일이 아니라
+  이번엔 메모리 부족이었음). `docker stats`/`docker compose stop`조차 응답 안 할
+  정도로 호스트가 눌려있었음.
+  - **해결 1**: `C:\Users\Administrator\.wslconfig`에 `memory=12GB` 설정 →
+    `wsl --shutdown`으로 재시작 (위스키 컨테이너들도 같이 내려갔다가 restart
+    정책 덕에 자동으로 다시 살아남, 약 40초 걸림). Docker 메모리 한도
+    7.7GB → 11.68GB로 확인됨.
+  - **해결 2**: `docker-compose.yml`의 `AIRFLOW__WEBSERVER__WORKERS`를 기본값
+    4에서 `1`로 낮춤 (혼자 쓰는 데모용 웹서버라 4개씩 안 필요함).
+  - 적용 후 재기동 확인: 전체 10개 컨테이너(위스키6 + tsi4, streamlit/postgres
+    포함하면 tsi5) 합쳐서 메모리 사용량 **2.7GB / 11.68GB (23%)**로 여유 확보,
+    webserver 헬스체크(`http://localhost:8090/health`) 정상 통과.
+- **다음 세션 참고**: 이제 두 스택을 동시에 켜놔도 자원 문제는 없어야 함. 그래도
+  `together-stay-index`는 24시간 떠있을 필요 없는 데모용이니, 안 쓸 때는
+  `docker compose stop`으로 내려두는 습관 권장 (CLAUDE.md에도 명시).
 
 ### 2026-09-17, 데스크톱 - Snowflake 키페어 인증으로 전환 (계정 재사용 확정)
 사용자가 "위스키 쪽 Snowflake 크레딧이 240 정도 남았고 널널하니 새 계정 안 파고 그냥
@@ -80,22 +113,16 @@ Connection id를 전부 새로 만들어서 절대 안 겹치게 설계했다 (�
 
 ## 진행 중 / 남은 작업
 
-Snowflake 계정/DB명은 이제 코드 기본값으로 다 채워져 있어서(위스키 계정 재사용,
-`.env`에 안 넣어도 됨) 실제로 사용자가 해야 하는 건 아래 4개뿐:
+**Snowflake/AWS 설정은 다 끝남** (2026-09-17 밤 업데이트 참고):
+- ✅ Snowflake 키페어 등록, DB/스키마/스테이지/테이블 생성 완료
+- ✅ S3 버킷(`together-stay-index-bronze`) + 전용 IAM 키 발급 + `.env` 기입 완료
+- ✅ `docker compose up -d`로 스택 기동 확인, 호스트 메모리 문제도 해결됨
 
-1. **[아직 안 함] Snowflake 워크시트에서 새 공개키 등록 SQL 1회 실행** -
-   `ALTER USER mtmt20 SET RSA_PUBLIC_KEY_2='...';` (공개키 값은 2026-09-17 업데이트
-   항목 참고, 또는 `secrets/rsa_key.pub` 파일에서 BEGIN/END 줄 빼고 한 줄로 이어붙이면
-   나옴). **이거 먼저 해야 이 프로젝트가 Snowflake에 붙을 수 있음.**
-2. 네이버 오픈API 키 발급 (developers.naver.com/apps/#/register → 검색 API) → `.env`의
-   `NAVER_CLIENT_ID`/`NAVER_CLIENT_SECRET`
-3. 이 프로젝트 전용 S3 버킷 신규 생성 (예: `together-stay-index-bronze`, 기존 위스키
-   버킷 재사용 금지) → `.env`의 `AWS_*`. Snowflake Storage Integration도 이 버킷
-   전용으로 새로 생성 필요.
-4. 1번 SQL 실행 후, [dags/sql/snowflake_setup.sql](dags/sql/snowflake_setup.sql)을
-   Snowflake 워크시트에서 1회 실행 (TOGETHER_STAY_DB/스테이지/RAW 테이블 생성)
+**남은 건 딱 1개, 네이버 오픈API 키뿐**:
+1. developers.naver.com/apps/#/register → 검색 API 신청 → 발급된
+   `NAVER_CLIENT_ID`/`NAVER_CLIENT_SECRET`을 `.env`에 채우기
 
-위 4개 끝나면: `docker compose up -d` (Airflow Connection은 이제 자동 등록됨 - 수동
-UI 등록 단계 없음) → DAG Unpause → 1회 실행 확인 → `docker compose run --rm tsi-dbt run`
-→ `http://localhost:8510`에서 대시보드 확인. 아직 실제 크롤링/COPY INTO/dbt run이
-한 번도 돈 적 없으니, 다음 세션에서 이 순서를 처음부터 검증해야 함.
+네이버 키만 채워지면: DAG(`together_stay_index_naver_ingestion`) Unpause → 1회
+실행 확인 → `docker compose run --rm tsi-dbt run` → `http://localhost:8510`에서
+대시보드 확인. 아직 실제 크롤링/COPY INTO/dbt run이 한 번도 돈 적 없으니, 다음
+세션(네이버 키 받은 후)에서 이 순서를 처음부터 끝까지 검증해야 함.
