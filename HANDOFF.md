@@ -27,6 +27,35 @@ Connection id를 전부 새로 만들어서 절대 안 겹치게 설계했다 (�
 
 ## 최근 업데이트 (최신이 위로)
 
+### 2026-09-17, 데스크톱 - Snowflake 키페어 인증으로 전환 (계정 재사용 확정)
+사용자가 "위스키 쪽 Snowflake 크레딧이 240 정도 남았고 널널하니 새 계정 안 파고 그냥
+이 계정 재사용하자"고 결정함. 그런데 위스키의 Snowflake 연결이 **비밀번호가 아니라
+키페어(RSA 개인키) 인증**이라는 걸 `whisky-pipeline/docker-compose.yml`에서 확인함
+(계정 `svgjcjl-uh88149`, user `mtmt20`, warehouse `WHISKY_WH`, role `ACCOUNTADMIN`).
+
+- 위스키가 쓰는 개인키 파일(`C:/Users/Administrator/.dbt/rsa_key.p8`)을 그대로
+  마운트해서 공유하려 했으나, Claude Code의 auto-mode 안전 분류기가 "Credential
+  Leakage"/"Secret-Store Writes"로 자동 차단함 (다른 프로젝트에 기존 키 파일 접근권을
+  그대로 넘기는 걸 막는 정상 동작). 우회하지 않고 **이 프로젝트 전용 키를 새로 발급**하는
+  쪽으로 방향 전환.
+- `openssl`로 새 RSA 키페어 생성 → [secrets/rsa_key.p8](secrets/rsa_key.p8) (개인키,
+  `.gitignore`에 추가돼 커밋 안 됨) / `secrets/rsa_key.pub` (공개키).
+- 같은 유저 `mtmt20`에 **두 번째 공개키**로 등록하는 방식 사용 (Snowflake는 유저당 키
+  2개까지 동시 허용 - `RSA_PUBLIC_KEY_2`). 위스키가 쓰는 첫 번째 키는 전혀 안 건드림.
+  **아직 사용자가 Snowflake 워크시트에서 `ALTER USER mtmt20 SET RSA_PUBLIC_KEY_2=...`
+  SQL을 실행 안 함 - 다음 세션에서 이거 됐는지부터 확인할 것** (공개키 값은 이 대화
+  로그에 있음, 필요하면 `secrets/rsa_key.pub`에서 다시 뽑으면 됨).
+- `docker-compose.yml`(airflow-common + tsi-streamlit + tsi-dbt 전부), `dbt/profiles.yml`,
+  `dbt/profiles.yml.example`, `streamlit_app/app.py`(PEM→DER 변환 로직 추가),
+  `streamlit_app/requirements.txt`(cryptography 추가), `.env.example`을 전부 비밀번호
+  방식에서 `private_key_path` 방식으로 고침. SNOWFLAKE_ACCOUNT/USER/WAREHOUSE/ROLE은
+  위스키 값을 기본값으로 docker-compose.yml에 박아둬서 `.env`에 안 채워도 동작하게 함.
+- `tsi-airflow-init`이 `together_stay_snowflake` Airflow Connection을 **자동으로
+  등록**하도록 명령어 추가함 (위스키가 하던 방식과 동일) - 예전 HANDOFF에 있던 "Admin
+  UI에서 수동 등록" 단계는 이제 필요 없음.
+- `docker compose config`로 문법 검증 통과. `tsi-streamlit` 이미지 재빌드 진행 중
+  (cryptography 의존성 추가 때문) - 다음 세션에서 빌드 성공했는지 확인할 것.
+
 ### 2026-09-15, 데스크톱 - Step 1~4 뼈대 완성 + 빌드 검증 + git init
 - Step 1 크롤러([dags/crawler/naver_crawler.py](dags/crawler/naver_crawler.py)): 네이버 검색
   오픈API(blog/cafearticle)로 키워드 검색 → BeautifulSoup으로 본문 보강 → Parquet 변환 →
@@ -51,19 +80,22 @@ Connection id를 전부 새로 만들어서 절대 안 겹치게 설계했다 (�
 
 ## 진행 중 / 남은 작업
 
-이건 전부 계정/키 발급이라 사용자가 직접 해야 함 (Claude가 대신 못 함):
+Snowflake 계정/DB명은 이제 코드 기본값으로 다 채워져 있어서(위스키 계정 재사용,
+`.env`에 안 넣어도 됨) 실제로 사용자가 해야 하는 건 아래 4개뿐:
 
-1. 네이버 오픈API 키 발급 (developers.naver.com/apps/#/register → 검색 API) → `.env`의
+1. **[아직 안 함] Snowflake 워크시트에서 새 공개키 등록 SQL 1회 실행** -
+   `ALTER USER mtmt20 SET RSA_PUBLIC_KEY_2='...';` (공개키 값은 2026-09-17 업데이트
+   항목 참고, 또는 `secrets/rsa_key.pub` 파일에서 BEGIN/END 줄 빼고 한 줄로 이어붙이면
+   나옴). **이거 먼저 해야 이 프로젝트가 Snowflake에 붙을 수 있음.**
+2. 네이버 오픈API 키 발급 (developers.naver.com/apps/#/register → 검색 API) → `.env`의
    `NAVER_CLIENT_ID`/`NAVER_CLIENT_SECRET`
-2. 이 프로젝트 전용 S3 버킷 신규 생성 (예: `together-stay-index-bronze`, 기존 위스키
-   버킷 재사용 금지) → `.env`의 `AWS_*`
-3. Snowflake 계정 정보 → `.env`의 `SNOWFLAKE_*` (DB는 코드가 `TOGETHER_STAY_DB`로
-   새로 만듦). Storage Integration도 이 버킷 전용으로 새로 생성 필요.
-4. `.env` 완성 후 [dags/sql/snowflake_setup.sql](dags/sql/snowflake_setup.sql)을
-   Snowflake 워크시트에서 1회 실행 (DB/스테이지/RAW 테이블 생성)
-5. `docker compose up -d` → `http://localhost:8090` (admin/admin) → Admin > Connections에서
-   `together_stay_snowflake` 커넥션 등록 → DAG Unpause
+3. 이 프로젝트 전용 S3 버킷 신규 생성 (예: `together-stay-index-bronze`, 기존 위스키
+   버킷 재사용 금지) → `.env`의 `AWS_*`. Snowflake Storage Integration도 이 버킷
+   전용으로 새로 생성 필요.
+4. 1번 SQL 실행 후, [dags/sql/snowflake_setup.sql](dags/sql/snowflake_setup.sql)을
+   Snowflake 워크시트에서 1회 실행 (TOGETHER_STAY_DB/스테이지/RAW 테이블 생성)
 
-위 5개 끝나면: DAG 1회 실행 확인 → `docker compose run --rm tsi-dbt run` →
-`http://localhost:8510`에서 대시보드 확인. 아직 실제 크롤링/COPY INTO/dbt run이 한
-번도 돈 적 없으니, 다음 세션에서 이 순서를 처음부터 검증해야 함.
+위 4개 끝나면: `docker compose up -d` (Airflow Connection은 이제 자동 등록됨 - 수동
+UI 등록 단계 없음) → DAG Unpause → 1회 실행 확인 → `docker compose run --rm tsi-dbt run`
+→ `http://localhost:8510`에서 대시보드 확인. 아직 실제 크롤링/COPY INTO/dbt run이
+한 번도 돈 적 없으니, 다음 세션에서 이 순서를 처음부터 검증해야 함.

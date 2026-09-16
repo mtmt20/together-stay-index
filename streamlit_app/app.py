@@ -20,6 +20,8 @@ import os
 import pandas as pd
 import snowflake.connector
 import streamlit as st
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
 
 st.set_page_config(page_title="Together-Stay Index", layout="wide")
 
@@ -28,13 +30,30 @@ st.set_page_config(page_title="Together-Stay Index", layout="wide")
 CACHE_TTL_SECONDS = 3600
 
 
+def _load_private_key_der() -> bytes:
+    """이 계정은 비밀번호가 아니라 키페어 인증을 쓴다. PEM(PKCS8) 개인키를
+    읽어서 snowflake-connector-python이 요구하는 DER 바이트로 변환한다."""
+    passphrase = os.environ.get("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE") or None
+    with open(os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"], "rb") as f:
+        private_key = serialization.load_pem_private_key(
+            f.read(),
+            password=passphrase.encode() if passphrase else None,
+            backend=default_backend(),
+        )
+    return private_key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+
 @st.cache_resource
 def get_connection() -> snowflake.connector.SnowflakeConnection:
     """Snowflake 커넥션은 세션당 한 번만 생성해 재사용한다."""
     return snowflake.connector.connect(
         account=os.environ["SNOWFLAKE_ACCOUNT"],
         user=os.environ["SNOWFLAKE_USER"],
-        password=os.environ["SNOWFLAKE_PASSWORD"],
+        private_key=_load_private_key_der(),
         role=os.environ.get("SNOWFLAKE_ROLE", "SYSADMIN"),
         warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
         database="TOGETHER_STAY_DB",
