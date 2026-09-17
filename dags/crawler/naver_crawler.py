@@ -9,13 +9,15 @@ Together-Stay Index - Step 1: 네이버 카페/블로그 크롤러
 
 설계 원칙 (왜 이렇게 짰는지)
 ---------------------------
-1) 네이버 검색 결과 페이지를 직접 requests/Selenium으로 긁는 방식은
-   봇 차단(캡차)에 매우 취약하고, 대회 심사 중 라이브 데모가 막힐 위험이 크다.
-   따라서 "검색(디스커버리)"은 네이버 공식 오픈 API(검색 API)로 안정적으로
-   수행하고, API가 주지 않는 "본문 전체 텍스트"만 BeautifulSoup으로
-   개별 글 URL에 접속해 보강한다. 이렇게 하면 문제에서 요구한
-   "BeautifulSoup/Selenium 크롤링"과 "검색 API" 둘 다 실제로 쓰면서도
-   안정성을 확보할 수 있다.
+1) **(2026-09-18 변경) 검색은 네이버 검색 결과 페이지를 직접 스크래핑한다.**
+   원래는 봇 차단 위험 때문에 네이버 공식 검색 오픈API를 쓰려고 했으나,
+   네이버가 검색 오픈API의 신규/재발급 자체를 막아놔서(기존에 등록되어
+   있던 다른 앱도 재등록 시도하면 "신규로 등록할 수 없는 API가
+   선택되었습니다"로 거부됨 - 계정을 새로 만들어도 동일) 공식 API 경로를
+   아예 쓸 수 없는 상태다. 그래서 어쩔 수 없이 검색 결과 페이지
+   (`search.naver.com`)를 직접 파싱하는 방식으로 전환했다. 이미 개별
+   글 본문을 가져올 때 쓰던 것과 동일한 방식(User-Agent 지정, 요청 간
+   지연시간)으로 예의 있게 접근해 차단 위험을 최대한 낮춘다.
 2) 본문 크롤링은 실패해도(로그인 필요/삭제글/차단 등) 전체 파이프라인이
    죽지 않도록 개별 요청 단위로 예외를 흡수한다. 대회 데모 중 특정 글
    하나 때문에 DAG 전체가 실패하면 안 되기 때문.
@@ -26,10 +28,11 @@ Together-Stay Index - Step 1: 네이버 카페/블로그 크롤러
 
 필요 환경변수
 -------------
-- NAVER_CLIENT_ID, NAVER_CLIENT_SECRET : 네이버 개발자센터에서 발급한
-  "검색" API 애플리케이션 키. https://developers.naver.com/apps/#/register
 - AWS_S3_BUCKET : 이 프로젝트 전용 S3 버킷명 (기존 프로젝트 버킷과 달라야 함)
 - AWS 자격증명은 boto3 기본 체인(환경변수/~/.aws/credentials/IAM Role)을 그대로 사용
+
+(참고: 예전에는 NAVER_CLIENT_ID/NAVER_CLIENT_SECRET이 필요했으나, 검색
+오픈API를 더 이상 못 쓰게 되면서 필요 없어졌다. 코드에 남아있어도 무시됨.)
 
 실행 예시
 --------
@@ -41,10 +44,13 @@ from __future__ import annotations
 import io
 import logging
 import os
+import re
 import time
+from collections import defaultdict
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Iterable
+from urllib.parse import quote
 
 import boto3
 import pandas as pd
@@ -66,10 +72,21 @@ SEARCH_KEYWORDS: list[str] = [
     "화장실 2개",
 ]
 
-# 네이버 검색 API 대상 카테고리. 카페글(cafearticle)과 블로그(blog) 둘 다 수집.
-NAVER_SEARCH_ENDPOINTS: dict[str, str] = {
-    "blog": "https://openapi.naver.com/v1/search/blog.json",
-    "cafearticle": "https://openapi.naver.com/v1/search/cafearticle.json",
+# 네이버 통합검색 결과 페이지(where= 파라미터로 카테고리 구분). blog=블로그 탭,
+# article=카페글 탭. 검색 오픈API가 막혀서(모듈 docstring 참고) 이 페이지를
+# 직접 파싱한다.
+NAVER_SEARCH_PAGES: dict[str, tuple[str, str]] = {
+    # source: (검색 결과 URL의 where 값, 결과 링크에 포함될 도메인 문자열)
+    "blog": ("blog", "blog.naver.com"),
+    "cafearticle": ("article", "cafe.naver.com"),
+}
+
+# 검색 결과 링크가 실제 "글"인지 판별하는 정규식. 둘 다 "도메인/아이디/숫자"
+# 형태(블로그 글 번호, 카페 게시글 번호)만 인정하고, 프로필 링크(도메인/아이디만)
+# 등은 걸러낸다.
+_ARTICLE_URL_PATTERNS: dict[str, str] = {
+    "blog.naver.com": r"blog\.naver\.com/[^/?]+/\d+$",
+    "cafe.naver.com": r"cafe\.naver\.com/[^/]+/\d+$",
 }
 
 # 카테고리별 한 키워드당 가져올 최대 결과 수 (API display 파라미터 상한은 100)
@@ -104,32 +121,55 @@ class NaverPost:
     crawled_at: str
 
 
-def _strip_html_tags(text: str) -> str:
-    """네이버 검색 API 응답에는 <b> 등 하이라이트 태그가 섞여 있어 제거한다."""
-    return BeautifulSoup(text, "html.parser").get_text()
+def search_naver(keyword: str, source: str) -> list[dict]:
+    """네이버 검색 결과 페이지(blog/카페글 탭)를 직접 파싱해서
+    [{title, link, description}, ...] 형태로 반환한다.
 
+    (왜 API 응답이랑 똑같은 dict 모양으로 맞췄나: 이 함수를 쓰는
+    crawl_keyword()가 기존에 "네이버 검색 오픈API의 JSON 응답" 모양을
+    그대로 가정하고 짜여 있었다. API 자체를 못 쓰게 됐다고 그 아래
+    로직까지 다 뜯어고치는 대신, 이 함수의 반환 모양만 API 시절과
+    동일하게 맞춰서 나머지 코드는 안 건드려도 되게 했다.)
 
-def search_naver(keyword: str, source: str, client_id: str, client_secret: str) -> list[dict]:
-    """네이버 검색 오픈 API로 키워드 하나를 조회한다.
-
-    직접 검색 결과 페이지를 스크래핑하지 않고 공식 API를 쓰는 이유는
-    모듈 docstring의 설계 원칙 1번 참고.
+    검색 결과 페이지 하나에는 SDS(네이버 새 UI) 렌더링 특성상 같은 글
+    링크가 썸네일/블로거이름/좋아요·댓글 수 배지/제목 등 여러 <a> 태그로
+    중복 등장한다. href 기준으로 묶어서, 그중 "그럴듯한 제목처럼 보이는"
+    가장 짧은 텍스트를 제목으로, 가장 긴 텍스트(보통 날짜+요약 스니펫)를
+    설명으로 쓴다. 댓글 수 같은 순수 숫자 배지가 제목으로 잘못 뽑히는 걸
+    막기 위해 숫자만 있거나 너무 짧은 텍스트는 제목 후보에서 제외한다.
     """
-    url = NAVER_SEARCH_ENDPOINTS[source]
-    headers = {
-        "X-Naver-Client-Id": client_id,
-        "X-Naver-Client-Secret": client_secret,
-    }
-    params = {
-        "query": keyword,
-        "display": min(RESULTS_PER_KEYWORD, 100),
-        "sort": "sim",  # 정확도순. 최신순이 필요하면 "date"로 변경.
-    }
+    where, domain = NAVER_SEARCH_PAGES[source]
+    url = f"https://search.naver.com/search.naver?where={where}&query={quote(keyword)}"
 
-    response = requests.get(url, headers=headers, params=params, timeout=10)
+    response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
     response.raise_for_status()
-    items = response.json().get("items", [])
-    logger.info("[%s/%s] 검색 결과 %d건 수신", keyword, source, len(items))
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    id_pattern = _ARTICLE_URL_PATTERNS[domain]
+    texts_by_link: dict[str, list[str]] = defaultdict(list)
+    for a in soup.find_all("a", href=True):
+        link = a["href"].split("?")[0]  # 카페 링크에 붙는 추적용 art= 토큰 제거
+        if domain not in link or not re.search(id_pattern, link):
+            continue
+        text = a.get_text(strip=True).replace("새 창 열림", "").strip()
+        if text:
+            texts_by_link[link].append(text)
+
+    items: list[dict] = []
+    for link, texts in texts_by_link.items():
+        # 순수 URL 표기 텍스트(예: "blog.naver.com›아이디")는 제외
+        candidates = [t for t in texts if domain not in t]
+        if not candidates:
+            continue
+        description = max(candidates, key=len)
+        # 숫자만 있는 배지(댓글/좋아요 수)나 너무 짧은 텍스트는 제목 후보 제외
+        title_candidates = [t for t in candidates if len(t) >= 5 and not t.isdigit()]
+        title = min(title_candidates, key=len) if title_candidates else description[:40]
+        items.append({"title": title, "link": link, "description": description})
+        if len(items) >= RESULTS_PER_KEYWORD:
+            break
+
+    logger.info("[%s/%s] 검색 결과 %d건 수신 (스크래핑)", keyword, source, len(items))
     return items
 
 
@@ -165,13 +205,14 @@ def fetch_full_text(url: str) -> str | None:
     return text or None
 
 
-def crawl_keyword(keyword: str, client_id: str, client_secret: str, with_full_text: bool = True) -> list[NaverPost]:
+def crawl_keyword(keyword: str, with_full_text: bool = True) -> list[NaverPost]:
     """키워드 하나에 대해 blog + cafearticle 검색 후 레코드 리스트로 변환한다."""
     posts: list[NaverPost] = []
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    for source in NAVER_SEARCH_ENDPOINTS:
-        items = search_naver(keyword, source, client_id, client_secret)
+    for source in NAVER_SEARCH_PAGES:
+        items = search_naver(keyword, source)
+        time.sleep(CRAWL_DELAY_SECONDS)  # 검색 결과 페이지 자체도 예의상 간격을 둔다
         for item in items:
             full_text = None
             if with_full_text:
@@ -182,10 +223,10 @@ def crawl_keyword(keyword: str, client_id: str, client_secret: str, with_full_te
                 NaverPost(
                     keyword=keyword,
                     source=source,
-                    title=_strip_html_tags(item.get("title", "")),
+                    title=item.get("title", ""),
                     link=item.get("link", ""),
-                    description=_strip_html_tags(item.get("description", "")),
-                    post_date=item.get("postdate") or item.get("pubDate"),
+                    description=item.get("description", ""),
+                    post_date=None,  # 검색 결과 페이지에서 정확한 날짜를 안정적으로 못 뽑아 비워둠
                     full_text=full_text,
                     crawled_at=now_iso,
                 )
@@ -199,12 +240,9 @@ def crawl_all_keywords(
     with_full_text: bool = True,
 ) -> pd.DataFrame:
     """모든 타겟 키워드를 순회하며 크롤링하고 하나의 DataFrame으로 합친다."""
-    client_id = os.environ["NAVER_CLIENT_ID"]
-    client_secret = os.environ["NAVER_CLIENT_SECRET"]
-
     all_posts: list[NaverPost] = []
     for keyword in keywords:
-        all_posts.extend(crawl_keyword(keyword, client_id, client_secret, with_full_text=with_full_text))
+        all_posts.extend(crawl_keyword(keyword, with_full_text=with_full_text))
 
     df = pd.DataFrame([asdict(p) for p in all_posts])
     logger.info("전체 수집 건수: %d", len(df))
