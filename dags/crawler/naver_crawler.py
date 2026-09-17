@@ -72,6 +72,22 @@ SEARCH_KEYWORDS: list[str] = [
     "화장실 2개",
 ]
 
+# "화장실 2개", "독채 마당" 같은 키워드는 여행/숙소 얘기뿐 아니라 인테리어·
+# 리모델링·부동산 카페 글에도 흔히 나온다 (예: "화장실 2개 리모델링 비용").
+# 그래서 제목+설명에 숙박 관련 단어가 하나라도 같이 나오는 글만 남기는
+# 2차 필터를 둔다. 이 목록에 없는 새 숙박 형태(예: "한옥스테이")가 계속
+# 걸러진다면 여기에 추가하면 된다.
+ACCOMMODATION_CONTEXT_TERMS: tuple[str, ...] = (
+    "숙소", "펜션", "풀빌라", "게스트하우스", "한옥", "캠핑", "글램핑",
+    "리조트", "여행", "숙박", "스테이", "카라반",
+)
+
+
+def _looks_like_accommodation_post(title: str, description: str) -> bool:
+    """제목/설명에 숙박 관련 문맥 단어가 하나라도 있는지 확인한다."""
+    combined = title + description
+    return any(term in combined for term in ACCOMMODATION_CONTEXT_TERMS)
+
 # 네이버 통합검색 결과 페이지(where= 파라미터로 카테고리 구분). blog=블로그 탭,
 # article=카페글 탭. 검색 오픈API가 막혀서(모듈 docstring 참고) 이 페이지를
 # 직접 파싱한다.
@@ -211,8 +227,19 @@ def crawl_keyword(keyword: str, with_full_text: bool = True) -> list[NaverPost]:
     now_iso = datetime.now(timezone.utc).isoformat()
 
     for source in NAVER_SEARCH_PAGES:
-        items = search_naver(keyword, source)
+        raw_items = search_naver(keyword, source)
         time.sleep(CRAWL_DELAY_SECONDS)  # 검색 결과 페이지 자체도 예의상 간격을 둔다
+
+        items = [
+            item for item in raw_items
+            if _looks_like_accommodation_post(item.get("title", ""), item.get("description", ""))
+        ]
+        if len(items) < len(raw_items):
+            logger.info(
+                "[%s/%s] 숙박 무관 글 %d건 제외 (%d -> %d건)",
+                keyword, source, len(raw_items) - len(items), len(raw_items), len(items),
+            )
+
         for item in items:
             full_text = None
             if with_full_text:
