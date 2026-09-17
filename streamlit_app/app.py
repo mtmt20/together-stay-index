@@ -30,16 +30,38 @@ st.set_page_config(page_title="Together-Stay Index", layout="wide")
 CACHE_TTL_SECONDS = 3600
 
 
+def _config(key: str, default: str | None = None) -> str | None:
+    """설정값을 두 군데에서 찾는다: 로컬 Docker는 환경변수, Streamlit
+    Community Cloud는 st.secrets(대시보드 설정 화면에 입력한 값)를 쓴다.
+    st.secrets가 없는 로컬 환경에서도 에러 없이 넘어가도록 예외를 흡수한다."""
+    try:
+        if key in st.secrets:
+            return st.secrets[key]
+    except Exception:  # noqa: BLE001 - secrets.toml 자체가 없는 로컬 환경
+        pass
+    return os.environ.get(key, default)
+
+
 def _load_private_key_der() -> bytes:
     """이 계정은 비밀번호가 아니라 키페어 인증을 쓴다. PEM(PKCS8) 개인키를
-    읽어서 snowflake-connector-python이 요구하는 DER 바이트로 변환한다."""
-    passphrase = os.environ.get("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE") or None
-    with open(os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"], "rb") as f:
-        private_key = serialization.load_pem_private_key(
-            f.read(),
-            password=passphrase.encode() if passphrase else None,
-            backend=default_backend(),
-        )
+    읽어서 snowflake-connector-python이 요구하는 DER 바이트로 변환한다.
+
+    로컬 Docker에서는 마운트된 파일(SNOWFLAKE_PRIVATE_KEY_PATH)을 읽고,
+    Streamlit Community Cloud에는 파일을 올릴 수 없으므로 개인키 PEM 텍스트
+    자체를 secret(SNOWFLAKE_PRIVATE_KEY)로 붙여넣게 한다."""
+    passphrase = _config("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE") or None
+    pem_text = _config("SNOWFLAKE_PRIVATE_KEY")
+    if pem_text:
+        pem_bytes = pem_text.encode()
+    else:
+        with open(os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"], "rb") as f:
+            pem_bytes = f.read()
+
+    private_key = serialization.load_pem_private_key(
+        pem_bytes,
+        password=passphrase.encode() if passphrase else None,
+        backend=default_backend(),
+    )
     return private_key.private_bytes(
         encoding=serialization.Encoding.DER,
         format=serialization.PrivateFormat.PKCS8,
@@ -51,11 +73,11 @@ def _load_private_key_der() -> bytes:
 def get_connection() -> snowflake.connector.SnowflakeConnection:
     """Snowflake 커넥션은 세션당 한 번만 생성해 재사용한다."""
     return snowflake.connector.connect(
-        account=os.environ["SNOWFLAKE_ACCOUNT"],
-        user=os.environ["SNOWFLAKE_USER"],
+        account=_config("SNOWFLAKE_ACCOUNT"),
+        user=_config("SNOWFLAKE_USER"),
         private_key=_load_private_key_der(),
-        role=os.environ.get("SNOWFLAKE_ROLE", "SYSADMIN"),
-        warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
+        role=_config("SNOWFLAKE_ROLE", "SYSADMIN"),
+        warehouse=_config("SNOWFLAKE_WAREHOUSE"),
         database="TOGETHER_STAY_DB",
         schema="GOLD",
     )
