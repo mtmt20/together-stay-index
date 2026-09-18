@@ -65,6 +65,17 @@ def _crawl_and_upload_to_s3(**context) -> None:
     context["ti"].xcom_push(key="uploaded_s3_key", value=s3_key)
 
 
+def _crawl_food_cafe_and_upload_to_s3(**context) -> None:
+    """crawler.food_cafe_crawler.run()을 호출하는 얇은 wrapper.
+
+    숙소 크롤링 태스크와 서로 의존관계 없이 독립적으로 돈다 (하나가
+    실패해도 다른 하나는 정상 적재되게 하기 위함)."""
+    from crawler.food_cafe_crawler import run
+
+    s3_key = run(with_full_text=True)
+    context["ti"].xcom_push(key="uploaded_food_cafe_s3_key", value=s3_key)
+
+
 with DAG(
     dag_id="together_stay_index_naver_ingestion",
     description="네이버 카페/블로그에서 다둥이/두가족 숙소 언급을 수집해 S3->Snowflake Raw로 적재",
@@ -89,3 +100,18 @@ with DAG(
     )
 
     crawl_and_upload >> copy_s3_to_snowflake_raw
+
+    # 맛집/카페 수집 (숙소 수집과 독립적인 별도 체인 - 하나가 실패해도
+    # 다른 하나는 그대로 성공할 수 있게 서로 의존시키지 않는다)
+    crawl_food_cafe_and_upload = PythonOperator(
+        task_id="crawl_food_cafe_and_upload_to_s3",
+        python_callable=_crawl_food_cafe_and_upload_to_s3,
+    )
+
+    copy_food_cafe_to_snowflake_raw = SnowflakeOperator(
+        task_id="copy_food_cafe_to_snowflake_raw",
+        snowflake_conn_id=SNOWFLAKE_CONN_ID,
+        sql=(SQL_DIR / "copy_into_food_cafe.sql").read_text(encoding="utf-8"),
+    )
+
+    crawl_food_cafe_and_upload >> copy_food_cafe_to_snowflake_raw

@@ -4,6 +4,9 @@ __pycache__/
 *.pyc
 .DS_Store
 secrets/
+dbt/target/
+dbt/logs/
+dbt/.user.yml
 
 # 크레딧 잔액/계정 식별자 등 내부 운영 메모라 공개 저장소엔 안 올림 (로컬에만 유지)
 HANDOFF.md

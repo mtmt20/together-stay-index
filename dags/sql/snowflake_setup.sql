@@ -13,20 +13,31 @@
 CREATE DATABASE IF NOT EXISTS TOGETHER_STAY_DB;
 CREATE SCHEMA IF NOT EXISTS TOGETHER_STAY_DB.RAW;
 
--- S3 Bronze 레이어와 연동할 외부 스테이지.
--- STORAGE_INTEGRATION을 쓰는 것이 액세스키 하드코딩보다 안전하다.
--- (사전에 `CREATE STORAGE INTEGRATION together_stay_s3_int ...` 로
---  이 프로젝트 전용 S3 버킷만 바라보는 통합 객체를 별도로 만들어 둘 것.
---  기존 프로젝트의 storage integration을 재사용하지 말 것 - 버킷 정책이
---  섞이면 권한 반경이 넓어져 위험하다.)
+-- (2026-09-17 실제로는 STORAGE_INTEGRATION 대신 아래처럼 스테이지에
+--  CREDENTIALS를 직접 넣는 방식으로 만들었다 - IAM Role 신뢰관계 설정
+--  없이 바로 되고, 이미 S3 업로드용으로 발급해둔 액세스키를 그대로
+--  재사용하면 되어서 더 간단하다. <..> 부분은 .env의 값으로 채울 것.)
 CREATE STAGE IF NOT EXISTS TOGETHER_STAY_DB.RAW.NAVER_S3_STAGE
-    URL = 's3://<TOGETHER-STAY-INDEX 전용 버킷명>/bronze/together-stay-index/naver_raw/'
-    STORAGE_INTEGRATION = together_stay_s3_int
+    URL = 's3://<AWS_S3_BUCKET>/bronze/together-stay-index/naver_raw/'
+    CREDENTIALS = (AWS_KEY_ID='<AWS_ACCESS_KEY_ID>' AWS_SECRET_KEY='<AWS_SECRET_ACCESS_KEY>')
     FILE_FORMAT = (TYPE = PARQUET);
 
 -- Raw 테이블. Parquet 컬럼을 VARIANT 하나로 받아서 실제 정형화는 dbt의
 -- Bronze -> Silver 단계에서 처리한다 (Raw 레이어는 있는 그대로 적재만).
 CREATE TABLE IF NOT EXISTS TOGETHER_STAY_DB.RAW.NAVER_POSTS_RAW (
+    raw_data       VARIANT,
+    source_file    STRING,
+    loaded_at      TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- 맛집/카페 크롤러(food_cafe_crawler.py)용 스테이지/테이블. 숙소용과
+-- 구조는 같지만 S3 경로/테이블을 분리해서 서로 안 섞이게 한다.
+CREATE STAGE IF NOT EXISTS TOGETHER_STAY_DB.RAW.FOOD_CAFE_S3_STAGE
+    URL = 's3://<AWS_S3_BUCKET>/bronze/together-stay-index/food_cafe_raw/'
+    CREDENTIALS = (AWS_KEY_ID='<AWS_ACCESS_KEY_ID>' AWS_SECRET_KEY='<AWS_SECRET_ACCESS_KEY>')
+    FILE_FORMAT = (TYPE = PARQUET);
+
+CREATE TABLE IF NOT EXISTS TOGETHER_STAY_DB.RAW.FOOD_CAFE_POSTS_RAW (
     raw_data       VARIANT,
     source_file    STRING,
     loaded_at      TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()

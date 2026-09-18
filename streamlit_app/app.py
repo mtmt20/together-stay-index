@@ -15,6 +15,7 @@ dbt Gold 레이어(GOLD.MART_KEYWORD_DAILY_TREND, GOLD.MART_CANDIDATE_POSTS)만
 
 from __future__ import annotations
 
+import json
 import os
 
 import pandas as pd
@@ -30,15 +31,30 @@ st.set_page_config(page_title="Together-Stay Index", layout="wide")
 CACHE_TTL_SECONDS = 3600
 
 
+# secrets.toml이 아예 없는 로컬 Docker 환경에서는 st.secrets를 건드리기만
+# 해도 Streamlit이 "No secrets found" 경고 배너를 화면에 계속 찍어낸다
+# (try/except로도 안 막힘 - Streamlit 런타임이 자체적으로 렌더링하는
+# 것으로 보임). 그래서 st.secrets를 아예 만지기 전에 파일 존재 여부부터
+# 확인해서, 파일이 있을 때만(=Streamlit Cloud) 접근한다.
+_SECRETS_FILE_EXISTS = any(
+    os.path.exists(p)
+    for p in (
+        "/app/.streamlit/secrets.toml",
+        os.path.expanduser("~/.streamlit/secrets.toml"),
+        ".streamlit/secrets.toml",
+    )
+)
+
+
 def _config(key: str, default: str | None = None) -> str | None:
     """설정값을 두 군데에서 찾는다: 로컬 Docker는 환경변수, Streamlit
-    Community Cloud는 st.secrets(대시보드 설정 화면에 입력한 값)를 쓴다.
-    st.secrets가 없는 로컬 환경에서도 에러 없이 넘어가도록 예외를 흡수한다."""
-    try:
-        if key in st.secrets:
-            return st.secrets[key]
-    except Exception:  # noqa: BLE001 - secrets.toml 자체가 없는 로컬 환경
-        pass
+    Community Cloud는 st.secrets(대시보드 설정 화면에 입력한 값)를 쓴다."""
+    if _SECRETS_FILE_EXISTS:
+        try:
+            if key in st.secrets:
+                return st.secrets[key]
+        except Exception:  # noqa: BLE001 - 혹시 모를 파싱 에러 등
+            pass
     return os.environ.get(key, default)
 
 
@@ -104,6 +120,24 @@ def load_candidate_posts() -> pd.DataFrame:
     )
 
 
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
+def load_food_cafe() -> pd.DataFrame:
+    conn = get_connection()
+    df = pd.read_sql(
+        "select CATEGORY, REGION, TITLE, LINK, SOURCE, CRAWLED_AT, "
+        "MENTIONS_REVISIT, MENTIONS_KIDS_FRIENDLY, MENTIONS_NATURE, "
+        "CAPACITY_HINT, PRICE_HINT, CONCEPT_TAGS, RECOMMEND_SCORE "
+        "from MART_FOOD_CAFE order by REGION, CATEGORY, RECOMMEND_SCORE desc",
+        conn,
+    )
+    # CONCEPT_TAGS는 Snowflake ARRAY라 JSON 문자열로 온다 - 화면 표시용으로 풀어준다.
+    if not df.empty:
+        df["CONCEPT_TAGS"] = df["CONCEPT_TAGS"].apply(
+            lambda v: ", ".join(json.loads(v)) if v else ""
+        )
+    return df
+
+
 st.title("Together-Stay Index")
 st.caption("다둥이 / 다가구 연합 체류형 숙소 수요 모니터링 대시보드 (PoC)")
 
@@ -116,6 +150,7 @@ with col2:
 try:
     trend_df = load_keyword_trend()
     posts_df = load_candidate_posts()
+    food_cafe_df = load_food_cafe()
 except Exception as exc:  # noqa: BLE001 - 대시보드 최상단에서 원인을 그대로 보여주기 위함
     st.error(
         "Snowflake 연결/조회에 실패했습니다. 환경변수(SNOWFLAKE_*)와 "
@@ -158,3 +193,59 @@ st.dataframe(
     use_container_width=True,
     hide_index=True,
 )
+
+# --- 지역별 갈만한 맛집/카페 ---------------------------------------------
+st.divider()
+st.subheader("지역별 갈만한 맛집 · 카페")
+st.caption(
+    "맛집은 재방문 언급이 있는 곳을 우선 정렬, 카페는 노키즈존이 아니면서 "
+    "자연·아동친화 요소가 있는 곳만 모았습니다."
+)
+
+if food_cafe_df.empty:
+    st.info("아직 맛집/카페 데이터가 없습니다. food_cafe_crawler DAG 태스크를 먼저 실행하세요.")
+else:
+    fc_col1, fc_col2 = st.columns(2)
+    with fc_col1:
+        region_options = sorted(food_cafe_df["REGION"].unique().tolist())
+        selected_regions = st.multiselect("지역 필터", region_options, default=region_options)
+    with fc_col2:
+        category_label = {"food": "맛집", "cafe": "카페"}
+        selected_category_labels = st.multiselect(
+            "카테고리", list(category_label.values()), default=list(category_label.values())
+        )
+        selected_categories = [k for k, v in category_label.items() if v in selected_category_labels]
+
+    fc_filtered = food_cafe_df[
+        food_cafe_df["REGION"].isin(selected_regions) & food_cafe_df["CATEGORY"].isin(selected_categories)
+    ]
+
+    food_tab, cafe_tab = st.tabs(["🍽️ 맛집 (재방문순)", "☕ 카페 (자연·아동친화)"])
+
+    with food_tab:
+        food_view = fc_filtered[fc_filtered["CATEGORY"] == "food"].sort_values(
+            "RECOMMEND_SCORE", ascending=False
+        )
+        st.dataframe(
+            food_view[["REGION", "TITLE", "LINK", "CONCEPT_TAGS", "CAPACITY_HINT", "PRICE_HINT", "CRAWLED_AT"]]
+            .rename(columns={
+                "REGION": "지역", "TITLE": "제목", "LINK": "링크", "CONCEPT_TAGS": "컨셉",
+                "CAPACITY_HINT": "인원(추정)", "PRICE_HINT": "가격(추정,원)", "CRAWLED_AT": "수집시각",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with cafe_tab:
+        cafe_view = fc_filtered[fc_filtered["CATEGORY"] == "cafe"].sort_values(
+            "RECOMMEND_SCORE", ascending=False
+        )
+        st.dataframe(
+            cafe_view[["REGION", "TITLE", "LINK", "CONCEPT_TAGS", "CAPACITY_HINT", "PRICE_HINT", "CRAWLED_AT"]]
+            .rename(columns={
+                "REGION": "지역", "TITLE": "제목", "LINK": "링크", "CONCEPT_TAGS": "컨셉",
+                "CAPACITY_HINT": "인원(추정)", "PRICE_HINT": "가격(추정,원)", "CRAWLED_AT": "수집시각",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )

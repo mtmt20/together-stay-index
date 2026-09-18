@@ -7,3 +7,5 @@ sources:
     tables:
       - name: naver_posts_raw
         description: "Step2 Airflow DAG가 S3에서 COPY INTO로 적재한 네이버 크롤링 원본(VARIANT)"
+      - name: food_cafe_posts_raw
+        description: "food_cafe_crawler가 S3에서 COPY INTO로 적재한 맛집/카페 크롤링 원본(VARIANT)"
