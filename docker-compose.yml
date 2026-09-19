@@ -5,13 +5,16 @@
 #   - 호스트 포트: 웹서버 8090 (기존 위스키 Airflow는 8080 사용 중이라 회피),
 #     Postgres 55432 (기본 5432/기존 프로젝트와 겹치지 않도록 회피)
 #   - 이미지도 Dockerfile로 별도 빌드 (기존 커스텀 이미지 재사용 안 함)
-#   - .env 파일로 자격증명을 주입하며, 그 안의 S3 버킷/Snowflake DB명도
-#     이 프로젝트 전용 이름을 쓰도록 .env.example에 강제 명시
+#   - .env 파일로 자격증명을 주입하며, 그 안의 S3 버킷명도 이 프로젝트
+#     전용 이름을 쓰도록 .env.example에 강제 명시
 #   - Streamlit 포트 8510 (기존 위스키 Streamlit들은 8501~8504 사용 중이라 회피)
-#   - dbt는 상시 구동 서비스가 아니라 `docker compose run --rm tsi-dbt ...`로만
-#     실행되는 "tools" 프로필로 분리 (docker compose up 시 자동 기동 안 됨 -
-#     dbt run이 곧 Snowflake 웨어하우스를 깨우는 행위이므로 의도치 않게
-#     계속 떠 있으면 안 된다)
+#   - dbt는 상시 구동 서비스가 아니라 `docker compose run --rm tsi-dbt`로만
+#     실행되는 "tools" 프로필로 분리 (docker compose up 시 자동 기동 안 됨)
+#
+# 2026-09-18: Snowflake -> DuckDB 이전. DuckDB는 서버가 아니라 파일 하나라서
+# 계정/웨어하우스/키페어가 필요 없다. ./warehouse 폴더를 tsi-dbt와
+# tsi-streamlit 양쪽에 마운트해서 같은 .duckdb 파일을 공유한다 (dbt가 쓰고
+# Streamlit이 읽음). Snowflake Airflow Connection 등록도 더 이상 없다.
 
 x-airflow-common: &airflow-common
   build: .
@@ -25,23 +28,17 @@ x-airflow-common: &airflow-common
     # 2026-09-17: 위스키 스택과 같은 호스트에서 동시에 돌리다 메모리 부족으로
     # gunicorn이 120초 내 응답 못 해 죽는 걸 확인 - 자원 사용량을 줄여둔다.
     AIRFLOW__WEBSERVER__WORKERS: "1"
-    # 크롤러/S3/Snowflake 관련 자격증명은 .env 파일에서 주입된다.
+    # 크롤러/S3 관련 자격증명은 .env 파일에서 주입된다.
     NAVER_CLIENT_ID: ${NAVER_CLIENT_ID}
     NAVER_CLIENT_SECRET: ${NAVER_CLIENT_SECRET}
     AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
     AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
     AWS_S3_BUCKET: ${AWS_S3_BUCKET}
-    SNOWFLAKE_ACCOUNT: ${SNOWFLAKE_ACCOUNT:-svgjcjl-uh88149}
-    SNOWFLAKE_USER: ${SNOWFLAKE_USER:-mtmt20}
-    SNOWFLAKE_WAREHOUSE: ${SNOWFLAKE_WAREHOUSE:-WHISKY_WH}
-    SNOWFLAKE_ROLE: ${SNOWFLAKE_ROLE:-ACCOUNTADMIN}
-    SNOWFLAKE_PRIVATE_KEY_PATH: /opt/secrets/rsa_key.p8
     PYTHONPATH: /opt/airflow/dags
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
-    - ./secrets:/opt/secrets:ro
   depends_on:
     tsi-postgres:
       condition: service_healthy
@@ -74,7 +71,6 @@ services:
       - |
         airflow db migrate
         airflow users create --username admin --password admin --firstname Together --lastname Stay --role Admin --email admin@example.com || true
-        airflow connections add together_stay_snowflake --conn-type snowflake --conn-login "$${SNOWFLAKE_USER}" --conn-schema RAW --conn-extra "{\"account\": \"$${SNOWFLAKE_ACCOUNT}\", \"warehouse\": \"$${SNOWFLAKE_WAREHOUSE}\", \"database\": \"TOGETHER_STAY_DB\", \"role\": \"$${SNOWFLAKE_ROLE}\", \"private_key_file\": \"$${SNOWFLAKE_PRIVATE_KEY_PATH}\"}" || true
     networks:
       - tsi_network
 
@@ -82,6 +78,11 @@ services:
     <<: *airflow-common
     container_name: tsi_airflow_webserver
     command: webserver
+    # 2026-09-18: gunicorn worker가 120초 내 응답 안 해서 웹서버가 통째로
+    # 죽는 간헐적 이슈가 있음 (원인 미확정, DuckDB 이전과 무관 - 이전에도
+    # 있었음). DAG 실행 자체는 scheduler가 담당해서 안 죽으므로 영향 없지만,
+    # UI 컨테이너가 죽은 채로 방치되지 않도록 자동 재시작을 걸어둔다.
+    restart: unless-stopped
     ports:
       - "8090:8080"  # 기존 위스키 Airflow(8080)와 겹치지 않도록 호스트만 8090으로 회피
     depends_on:
@@ -108,13 +109,9 @@ services:
     build: ./streamlit_app
     container_name: tsi_streamlit
     environment:
-      SNOWFLAKE_ACCOUNT: ${SNOWFLAKE_ACCOUNT:-svgjcjl-uh88149}
-      SNOWFLAKE_USER: ${SNOWFLAKE_USER:-mtmt20}
-      SNOWFLAKE_ROLE: ${SNOWFLAKE_ROLE:-ACCOUNTADMIN}
-      SNOWFLAKE_WAREHOUSE: ${SNOWFLAKE_WAREHOUSE:-WHISKY_WH}
-      SNOWFLAKE_PRIVATE_KEY_PATH: /opt/secrets/rsa_key.p8
+      DUCKDB_PATH: /data/together_stay.duckdb
     volumes:
-      - ./secrets:/opt/secrets:ro
+      - ./warehouse:/data
     ports:
       - "8510:8501"  # 기존 위스키 Streamlit(8501~8504)과 겹치지 않도록 회피
     networks:
@@ -127,18 +124,17 @@ services:
     container_name: tsi_dbt
     profiles: ["tools"]  # `docker compose up`에 포함되지 않음. 수동 실행 전용.
     environment:
-      SNOWFLAKE_ACCOUNT: ${SNOWFLAKE_ACCOUNT:-svgjcjl-uh88149}
-      SNOWFLAKE_USER: ${SNOWFLAKE_USER:-mtmt20}
-      SNOWFLAKE_ROLE: ${SNOWFLAKE_ROLE:-ACCOUNTADMIN}
-      SNOWFLAKE_WAREHOUSE: ${SNOWFLAKE_WAREHOUSE:-WHISKY_WH}
-      SNOWFLAKE_PRIVATE_KEY_PATH: /opt/secrets/rsa_key.p8
+      DUCKDB_PATH: /data/together_stay.duckdb
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_S3_BUCKET: ${AWS_S3_BUCKET}
+      AWS_REGION: ${AWS_REGION:-ap-northeast-2}
       DBT_PROFILES_DIR: /dbt
     volumes:
       - ./dbt:/dbt
-      - ./secrets:/opt/secrets:ro
+      - ./warehouse:/data
     working_dir: /dbt
-    entrypoint: ["dbt"]
-    command: ["run"]
+    entrypoint: ["/bin/bash", "run_and_publish.sh"]
     networks:
       - tsi_network
 

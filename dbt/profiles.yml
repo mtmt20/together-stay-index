@@ -1,21 +1,27 @@
 # ~/.dbt/profiles.yml 에 이 내용을 복사해 넣거나, DBT_PROFILES_DIR로 이 폴더를
-# 가리키게 설정한다. 비밀번호를 파일에 직접 쓰지 않고 환경변수로 주입한다.
+# 가리키게 설정한다.
 #
-# 기존 프로젝트(위스키 등)가 이미 dbt profiles.yml을 쓰고 있다면, 이 블록을
-# "추가"만 하고 기존 profile 이름/DB는 절대 건드리지 말 것. database는
-# 반드시 TOGETHER_STAY_DB로 새 값을 써서 기존 DB와 분리된 상태를 유지한다.
-
+# 2026-09-18: Snowflake에서 DuckDB로 이전했다. DuckDB는 서버가 아니라
+# "파일 하나 + 라이브러리"라서 계정/비밀번호/웨어하우스가 없다. path가
+# 가리키는 .duckdb 파일이 곧 데이터베이스이고, dbt run이 끝나면 그 파일
+# 안에 SILVER/GOLD 스키마와 테이블이 그대로 남는다 (docker-compose.yml이
+# ./warehouse 폴더를 컨테이너의 /data에 마운트해서 tsi-dbt와 tsi-streamlit이
+# 같은 파일을 공유해서 본다).
+#
+# S3(Bronze)의 parquet 파일은 httpfs 확장으로 직접 읽는다(staging 모델의
+# read_parquet('s3://...') 참고) - Snowflake처럼 COPY INTO로 별도 RAW
+# 테이블에 옮겨 적재하는 단계가 아예 필요 없어졌다.
 together_stay_index:
   target: dev
   outputs:
     dev:
-      type: snowflake
-      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
-      user: "{{ env_var('SNOWFLAKE_USER') }}"
-      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH') }}"
-      role: "{{ env_var('SNOWFLAKE_ROLE', 'SYSADMIN') }}"
-      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE') }}"
-      database: TOGETHER_STAY_DB
-      schema: SILVER
+      type: duckdb
+      path: "{{ env_var('DUCKDB_PATH', '/data/together_stay.duckdb') }}"
+      schema: main
+      extensions:
+        - httpfs
+      settings:
+        s3_region: "{{ env_var('AWS_REGION', 'ap-northeast-2') }}"
+        s3_access_key_id: "{{ env_var('AWS_ACCESS_KEY_ID') }}"
+        s3_secret_access_key: "{{ env_var('AWS_SECRET_ACCESS_KEY') }}"
       threads: 4
-      client_session_keep_alive: false

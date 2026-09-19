@@ -16,11 +16,16 @@ select
     mentions_nature,
     capacity_hint,
     price_hint,
-    -- 화면에서 바로 보여줄 컨셉 태그 (여러 개 동시 해당 가능)
-    array_construct_compact(
-        iff(mentions_revisit, '재방문많음', null),
-        iff(mentions_kids_friendly, '아동친화', null),
-        iff(mentions_nature, '자연/뷰', null)
+    -- 화면에서 바로 보여줄 컨셉 태그 (여러 개 동시 해당 가능).
+    -- DuckDB에는 array_construct_compact/iff가 없어 list_filter로
+    -- null을 걸러내는 방식으로 대체.
+    list_filter(
+        [
+            case when mentions_revisit then '재방문많음' end,
+            case when mentions_kids_friendly then '아동친화' end,
+            case when mentions_nature then '자연/뷰' end
+        ],
+        x -> x is not null
     ) as concept_tags,
     -- 기본 정렬용 점수: 맛집은 재방문 우선, 카페는 자연+아동친화 우선
     case

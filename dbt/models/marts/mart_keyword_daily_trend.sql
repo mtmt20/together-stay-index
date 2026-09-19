@@ -7,7 +7,7 @@ select
     date_trunc('day', crawled_at)::date as crawled_date,
     count(*)                                              as mention_count,
     count(distinct link)                                  as unique_post_count,
-    sum(iff(full_text is not null, 1, 0))                 as with_full_text_count
+    sum(case when full_text is not null then 1 else 0 end) as with_full_text_count
 from {{ ref('stg_naver_posts') }}
 group by 1, 2
 order by 1, 2

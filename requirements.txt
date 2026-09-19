@@ -2,10 +2,10 @@
 # Airflow 자체는 base 이미지(apache/airflow)에 이미 들어있으므로 여기서는
 # DAG/크롤러가 추가로 필요로 하는 패키지만 명시한다.
 #
-# 버전을 개별적으로 세게 고정하지 않는 이유: apache-airflow-providers-snowflake
-# 는 Airflow 코어/다른 provider와 얽힌 의존성 그래프가 매우 커서, 여기 있는
-# pandas/boto3/pyarrow/requests 등을 우리가 임의 버전으로 고정하면 pip
-# 리졸버가 호환 조합을 못 찾고 무한 백트래킹(ResolutionTooDeep)에 빠진다.
+# 버전을 개별적으로 세게 고정하지 않는 이유: Airflow 코어와 얽힌 의존성
+# 그래프가 매우 커서, 여기 있는 pandas/boto3/pyarrow/requests 등을 우리가
+# 임의 버전으로 고정하면 pip 리졸버가 호환 조합을 못 찾고 무한 백트래킹
+# (ResolutionTooDeep)에 빠진 적이 있었다.
 # Dockerfile에서 Airflow 공식 constraints 파일(--constraint)을 함께 써서
 # 이 패키지들의 정확한 버전은 그 파일이 정하게 맡긴다 (Airflow 공식 권장 방식).
 # https://airflow.apache.org/docs/apache-airflow/stable/installation/installing-from-pypi.html
@@ -17,4 +17,3 @@ pandas
 pyarrow
 boto3
 python-dotenv
-apache-airflow-providers-snowflake

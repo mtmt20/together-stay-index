@@ -1,5 +1,6 @@
 # Together-Stay Index dbt 프로젝트
-# Bronze(S3) -> Raw(Snowflake, Step2 DAG가 적재) -> Silver(staging) -> Gold(marts)
+# Bronze(S3 parquet) -> Silver(staging, S3를 httpfs로 직접 read_parquet) -> Gold(marts)
+# 2026-09-18: Snowflake -> DuckDB 이전. 별도 RAW 적재 단계가 없어졌다.
 
 name: 'together_stay_index'
 version: '1.0.0'

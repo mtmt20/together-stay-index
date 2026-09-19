@@ -22,9 +22,8 @@ Together-Stay Index - Step 1: 네이버 카페/블로그 크롤러
    죽지 않도록 개별 요청 단위로 예외를 흡수한다. 대회 데모 중 특정 글
    하나 때문에 DAG 전체가 실패하면 안 되기 때문.
 3. 이 프로젝트는 기존 위스키/부동산 파이프라인과 완전히 분리된 신규
-   프로젝트이므로, S3 버킷/Snowflake DB/Airflow 커넥션 이름을 전부
-   "TOGETHER_STAY" 계열의 고유한 이름으로 강제해 기존 리소스와
-   절대 겹치지 않도록 한다 (환경변수 필수값으로 강제).
+   프로젝트이므로, S3 버킷 이름을 "TOGETHER_STAY" 계열의 고유한 이름으로
+   강제해 기존 리소스와 절대 겹치지 않도록 한다 (환경변수 필수값으로 강제).
 
 필요 환경변수
 -------------
@@ -279,7 +278,7 @@ def crawl_all_keywords(
 def upload_dataframe_to_s3(df: pd.DataFrame, bucket: str | None = None) -> str:
     """DataFrame을 Parquet으로 변환해 S3 Bronze 레이어에 업로드한다.
 
-    반환값은 업로드된 S3 key (Snowflake COPY INTO에서 그대로 참조하기 위함).
+    반환값은 업로드된 S3 key (dbt가 read_parquet으로 그대로 참조하기 위함).
     """
     bucket = bucket or os.environ["AWS_S3_BUCKET"]
 

@@ -2,138 +2,105 @@
 Together-Stay Index - Step 4: Streamlit 대시보드 (PoC)
 ======================================================
 
-dbt Gold 레이어(GOLD.MART_KEYWORD_DAILY_TREND, GOLD.MART_CANDIDATE_POSTS)만
-읽는 얇은 조회 화면이다. RAW/Silver를 직접 스캔하지 않는 이유: 대시보드를
-심사위원이 여러 번 새로고침해도 무거운 집계 쿼리가 매번 웨어하우스를
-깨우지 않도록, 무거운 집계는 이미 dbt가 끝내놓고 여기서는 가벼운 SELECT만
-한다.
+dbt Gold 레이어(gold.mart_keyword_daily_trend, gold.mart_candidate_posts,
+gold.mart_food_cafe)만 읽는 얇은 조회 화면이다.
 
-같은 이유로 쿼리 결과는 st.cache_data(ttl=...)로 캐싱한다. 캐시된 동안은
-버튼을 눌러도 실제 Snowflake 호출이 나가지 않는다 - 트라이얼 크레딧
-환경에서 resume 횟수를 줄이기 위한 핵심 장치.
+2026-09-18: Snowflake -> DuckDB 이전.
+  - 로컬 Docker: tsi-dbt가 만든 .duckdb 파일을 tsi-streamlit도 같은 볼륨
+    (./warehouse)으로 마운트해서 그냥 읽기 전용으로 연다. 계정/비밀번호가
+    아예 없다.
+  - Streamlit Community Cloud: 로컬 파일을 마운트할 수 없으므로, dbt가
+    dbt run 직후 S3에 올려둔 스냅샷(gold-warehouse/together_stay.duckdb)을
+    앱 시작 시 내려받아 임시 파일로 연다. 이때만 AWS 자격증명이 필요하고
+    Snowflake 키페어 같은 복잡한 설정이 없어 secrets 입력도 훨씬 쉬워졌다.
 """
 
 from __future__ import annotations
 
-import json
 import os
+import tempfile
 
+import duckdb
 import pandas as pd
-import snowflake.connector
 import streamlit as st
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import serialization
 
 st.set_page_config(page_title="Together-Stay Index", layout="wide")
 
-# 쿼리 캐시 유효시간(초). 대시보드를 아무리 새로고침해도 이 시간 안에는
-# Snowflake 웨어하우스를 다시 깨우지 않는다. 데모 직전에만 짧게 낮추면 된다.
+# 쿼리/커넥션 캐시 유효시간(초). 데모 직전에만 짧게 낮추면 된다.
 CACHE_TTL_SECONDS = 3600
 
-
-# secrets.toml이 아예 없는 로컬 Docker 환경에서는 st.secrets를 건드리기만
-# 해도 Streamlit이 "No secrets found" 경고 배너를 화면에 계속 찍어낸다
-# (try/except로도 안 막힘 - Streamlit 런타임이 자체적으로 렌더링하는
-# 것으로 보임). 그래서 st.secrets를 아예 만지기 전에 파일 존재 여부부터
-# 확인해서, 파일이 있을 때만(=Streamlit Cloud) 접근한다.
-_SECRETS_FILE_EXISTS = any(
-    os.path.exists(p)
-    for p in (
-        "/app/.streamlit/secrets.toml",
-        os.path.expanduser("~/.streamlit/secrets.toml"),
-        ".streamlit/secrets.toml",
-    )
-)
+# 로컬 Docker에서는 이 경로가 실제로 마운트되어 있다. Streamlit Cloud에는
+# 이 파일이 없으므로 S3에서 내려받는 경로로 분기한다.
+LOCAL_DUCKDB_PATH = os.environ.get("DUCKDB_PATH", "/data/together_stay.duckdb")
+S3_WAREHOUSE_KEY = "gold-warehouse/together_stay.duckdb"
 
 
 def _config(key: str, default: str | None = None) -> str | None:
     """설정값을 두 군데에서 찾는다: 로컬 Docker는 환경변수, Streamlit
     Community Cloud는 st.secrets(대시보드 설정 화면에 입력한 값)를 쓴다."""
-    if _SECRETS_FILE_EXISTS:
-        try:
-            if key in st.secrets:
-                return st.secrets[key]
-        except Exception:  # noqa: BLE001 - 혹시 모를 파싱 에러 등
-            pass
+    try:
+        if key in st.secrets:
+            return st.secrets[key]
+    except Exception:  # noqa: BLE001 - secrets.toml이 아예 없는 로컬 환경 대비
+        pass
     return os.environ.get(key, default)
 
 
-def _load_private_key_der() -> bytes:
-    """이 계정은 비밀번호가 아니라 키페어 인증을 쓴다. PEM(PKCS8) 개인키를
-    읽어서 snowflake-connector-python이 요구하는 DER 바이트로 변환한다.
+@st.cache_resource(ttl=CACHE_TTL_SECONDS)
+def get_connection() -> duckdb.DuckDBPyConnection:
+    """DuckDB 커넥션은 세션당 한 번만 생성해 재사용한다."""
+    if os.path.exists(LOCAL_DUCKDB_PATH):
+        return duckdb.connect(LOCAL_DUCKDB_PATH, read_only=True)
 
-    로컬 Docker에서는 마운트된 파일(SNOWFLAKE_PRIVATE_KEY_PATH)을 읽고,
-    Streamlit Community Cloud에는 파일을 올릴 수 없으므로 개인키 PEM 텍스트
-    자체를 secret(SNOWFLAKE_PRIVATE_KEY)로 붙여넣게 한다."""
-    passphrase = _config("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE") or None
-    pem_text = _config("SNOWFLAKE_PRIVATE_KEY")
-    if pem_text:
-        pem_bytes = pem_text.encode()
-    else:
-        with open(os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"], "rb") as f:
-            pem_bytes = f.read()
+    import boto3
 
-    private_key = serialization.load_pem_private_key(
-        pem_bytes,
-        password=passphrase.encode() if passphrase else None,
-        backend=default_backend(),
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id=_config("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=_config("AWS_SECRET_ACCESS_KEY"),
+        region_name=_config("AWS_REGION", "ap-northeast-2"),
     )
-    return private_key.private_bytes(
-        encoding=serialization.Encoding.DER,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
+    tmp_path = os.path.join(tempfile.gettempdir(), "together_stay_snapshot.duckdb")
+    s3.download_file(_config("AWS_S3_BUCKET"), S3_WAREHOUSE_KEY, tmp_path)
+    return duckdb.connect(tmp_path, read_only=True)
 
 
-@st.cache_resource
-def get_connection() -> snowflake.connector.SnowflakeConnection:
-    """Snowflake 커넥션은 세션당 한 번만 생성해 재사용한다."""
-    return snowflake.connector.connect(
-        account=_config("SNOWFLAKE_ACCOUNT"),
-        user=_config("SNOWFLAKE_USER"),
-        private_key=_load_private_key_der(),
-        role=_config("SNOWFLAKE_ROLE", "SYSADMIN"),
-        warehouse=_config("SNOWFLAKE_WAREHOUSE"),
-        database="TOGETHER_STAY_DB",
-        schema="GOLD",
-    )
+def _query(sql: str) -> pd.DataFrame:
+    df = get_connection().execute(sql).fetchdf()
+    df.columns = [c.upper() for c in df.columns]
+    return df
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS)
 def load_keyword_trend() -> pd.DataFrame:
-    conn = get_connection()
-    return pd.read_sql(
-        "select KEYWORD, CRAWLED_DATE, MENTION_COUNT, UNIQUE_POST_COUNT "
-        "from MART_KEYWORD_DAILY_TREND order by CRAWLED_DATE",
-        conn,
+    return _query(
+        "select keyword, crawled_date, mention_count, unique_post_count "
+        "from gold.mart_keyword_daily_trend order by crawled_date"
     )
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS)
 def load_candidate_posts() -> pd.DataFrame:
-    conn = get_connection()
-    return pd.read_sql(
-        "select KEYWORD, SOURCE, TITLE, LINK, CRAWLED_AT, "
-        "MENTIONS_BATHROOM, MENTIONS_YARD, MENTIONS_WHOLE_HOUSE "
-        "from MART_CANDIDATE_POSTS order by CRAWLED_AT desc",
-        conn,
+    return _query(
+        "select keyword, source, title, link, crawled_at, "
+        "mentions_bathroom, mentions_yard, mentions_whole_house "
+        "from gold.mart_candidate_posts order by crawled_at desc"
     )
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS)
 def load_food_cafe() -> pd.DataFrame:
-    conn = get_connection()
-    df = pd.read_sql(
-        "select CATEGORY, REGION, TITLE, LINK, SOURCE, CRAWLED_AT, "
-        "MENTIONS_REVISIT, MENTIONS_KIDS_FRIENDLY, MENTIONS_NATURE, "
-        "CAPACITY_HINT, PRICE_HINT, CONCEPT_TAGS, RECOMMEND_SCORE "
-        "from MART_FOOD_CAFE order by REGION, CATEGORY, RECOMMEND_SCORE desc",
-        conn,
+    df = _query(
+        "select category, region, title, link, source, crawled_at, "
+        "mentions_revisit, mentions_kids_friendly, mentions_nature, "
+        "capacity_hint, price_hint, concept_tags, recommend_score "
+        "from gold.mart_food_cafe order by region, category, recommend_score desc"
     )
-    # CONCEPT_TAGS는 Snowflake ARRAY라 JSON 문자열로 온다 - 화면 표시용으로 풀어준다.
+    # concept_tags는 DuckDB LIST 컬럼이라 파이썬 리스트/배열로 그대로 온다 -
+    # 화면 표시용으로 문자열로 풀어준다.
     if not df.empty:
         df["CONCEPT_TAGS"] = df["CONCEPT_TAGS"].apply(
-            lambda v: ", ".join(json.loads(v)) if v else ""
+            lambda v: ", ".join(list(v)) if v is not None and len(v) > 0 else ""
         )
     return df
 
@@ -145,6 +112,7 @@ col1, col2 = st.columns([3, 1])
 with col2:
     if st.button("데이터 새로고침 (캐시 초기화)"):
         st.cache_data.clear()
+        st.cache_resource.clear()
         st.rerun()
 
 try:
@@ -153,8 +121,8 @@ try:
     food_cafe_df = load_food_cafe()
 except Exception as exc:  # noqa: BLE001 - 대시보드 최상단에서 원인을 그대로 보여주기 위함
     st.error(
-        "Snowflake 연결/조회에 실패했습니다. 환경변수(SNOWFLAKE_*)와 "
-        "dbt run이 먼저 수행되었는지 확인하세요."
+        "DuckDB 연결/조회에 실패했습니다. dbt run(및 publish_to_s3.py)이 "
+        "먼저 수행되었는지 확인하세요."
     )
     st.exception(exc)
     st.stop()

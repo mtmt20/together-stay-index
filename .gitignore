@@ -8,6 +8,11 @@ dbt/target/
 dbt/logs/
 dbt/.user.yml
 
+# DuckDB 데이터 파일 - dbt run이 만들어내는 결과물이라 커밋 안 함
+# (S3에 스냅샷을 올려두므로 로컬 파일이 없어도 재현 가능)
+warehouse/*.duckdb
+warehouse/*.duckdb.wal
+
 # 크레딧 잔액/계정 식별자 등 내부 운영 메모라 공개 저장소엔 안 올림 (로컬에만 유지)
 HANDOFF.md
 CLAUDE.md
